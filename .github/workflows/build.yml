@@ -1,0 +1,160 @@
+name: Build fgetpriority (all KMI)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [lkm]
+    paths:
+      - .github/workflows/build.yml
+      - kernel/**
+      - module/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.kmi }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build ARM64 kernel module
+        env:
+          KMI: ${{ matrix.kmi }}
+        run: |
+          set -euo pipefail
+          export KDIR="/opt/ddk/kdir/$KMI"
+          test -f "$KDIR/Makefile"
+          clang --version
+          mkdir -p "$GITHUB_WORKSPACE/out/ko"
+          make -C kernel -f Makefile.ddk modules \
+            KMI="$KMI" \
+            KO_INSTALL_DIR="$GITHUB_WORKSPACE/out/ko"
+          ko="$GITHUB_WORKSPACE/out/ko/${KMI}_arm64_fgetpriority.ko"
+          test -s "$ko"
+          file "$ko"
+          llvm-readelf --file-header "$ko" | grep 'Machine:.*AArch64'
+
+      - name: Upload KMI module
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fgetpriority-ko-${{ matrix.kmi }}
+          path: out/ko/*.ko
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: Package all 8 KMI
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout installer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download all KMI modules
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: fgetpriority-ko-*
+          path: module/ko
+          merge-multiple: true
+
+      - name: Verify and package installable ZIP
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import re
+          import zipfile
+
+          kmis = (
+              "android12-5.10", "android13-5.10", "android13-5.15",
+              "android14-5.15", "android14-6.1", "android15-6.6",
+              "android16-6.12", "android17-6.18",
+          )
+          module = Path("module")
+          expected = {f"{kmi}_arm64_fgetpriority.ko" for kmi in kmis}
+          actual = {p.name for p in (module / "ko").glob("*.ko")}
+          if actual != expected:
+              raise SystemExit(
+                  f"KMI module mismatch: missing={sorted(expected - actual)}, "
+                  f"unexpected={sorted(actual - expected)}"
+              )
+          for name in expected:
+              if (module / "ko" / name).stat().st_size == 0:
+                  raise SystemExit(f"Empty kernel module: {name}")
+          for name in ("module.prop", "customize.sh", "service.sh"):
+              if not (module / name).is_file():
+                  raise SystemExit(f"Missing installer file: {name}")
+
+          props = dict(
+              line.split("=", 1)
+              for line in (module / "module.prop").read_text().splitlines()
+              if "=" in line
+          )
+          version = props["version"]
+          if not re.fullmatch(r"[A-Za-z0-9_.+-]+", version):
+              raise SystemExit(f"Invalid module version: {version!r}")
+          dist = Path("dist")
+          dist.mkdir(exist_ok=True)
+          archive = dist / f"fgetpriority_{version}_all-kmi.zip"
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+              for path in sorted(module.rglob("*")):
+                  if path.is_file():
+                      output.write(path, path.relative_to(module).as_posix())
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          (dist / "SHA256SUMS").write_text(f"{digest}  {archive.name}\n")
+          (dist / "BUILD-INFO.txt").write_text(
+              f"Source commit: {os.environ['GITHUB_SHA']}\n"
+              f"Workflow run: {os.environ['GITHUB_RUN_ID']}\n"
+              "Architecture: arm64\n"
+              + "KMI: " + ", ".join(kmis) + "\n"
+          )
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+              summary.write(
+                  "## fgetpriority: all 8 KMI built successfully\n\n"
+                  f"Installer: `{archive.name}`\n\n"
+                  "Download **fgetpriority-all-kmi** from Artifacts, extract it, "
+                  "and install the inner ZIP through your root manager.\n\n"
+                  + "\n".join(f"- `{kmi}`" for kmi in kmis) + "\n"
+              )
+          print(f"Created {archive} with all {len(kmis)} KMI modules")
+          PY
+
+      - name: Upload installable module ZIP
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fgetpriority-all-kmi
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 90
