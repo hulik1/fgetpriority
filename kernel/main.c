@@ -19,83 +19,30 @@ static_assert(1 == 0, "ARM64 only!");
 #endif
 
 #ifdef MODULE /* overrides for LKM */
-static uintptr_t kallsyms_lookup_name_fn = 0x0;
-static __nocfi unsigned long __kallsyms_lookup_name(const char *name)
-{
-	return ((typeof (__kallsyms_lookup_name) *)kallsyms_lookup_name_fn)(name);
-}
-#define kallsyms_lookup_name __kallsyms_lookup_name
 
-static int bootstrap_kallsyms_lookup_name(uintptr_t ptr)
-{
-	extern long copy_from_kernel_nofault(void *dst, const void *src, size_t size);
-
-	constexpr int max_iter = 100000;
-	constexpr char sym[] = "kallsyms_lookup_name+0x0/";
-	uintptr_t anchor = ptr;
-
-	char buf[KSYM_SYMBOL_LEN];
-	uint32_t ibuf;
-	int iter = 0;
-
-	uintptr_t curr = ptr;
-	bool up = true;
-
-	/**
-	 * radiating scan, expect some cache trashing.
-	 * however for this one it is worth it.
-	 */
-start_r:
-	if (iter >= max_iter) {
-		pr_info("%s: bootsrap fail! iter: %d\n", __func__, iter);
-		return -ERANGE;
-	}
-
-	if (!!copy_from_kernel_nofault(&ibuf, (void *)curr, sizeof(uint32_t)))
-		goto inc;
-
-	if (sprint_symbol(buf, curr) < sizeof(sym))
-		goto inc;
-
-	if (strstarts(buf, sym))
-		goto found;
-
-inc:
-	if (up) {
-		iter++;
-		curr = anchor + sizeof(uint32_t) * iter;
-		up = false;
-	} else {
-		curr = anchor - sizeof(uint32_t) * iter;
-		up = true;
-	}
-
-	goto start_r;
-
-found:
-	pr_info("%s: %s found at 0x%lx iter: %d\n", __func__, buf, curr, iter);
-	*(volatile uintptr_t *)&kallsyms_lookup_name_fn = curr;
-	smp_mb();
-	return 0;
-}
-
+static uintptr_t aarch64_insn_patch_text_fn = 0x0;
 static __nocfi int __aarch64_insn_patch_text(void *addrs[], u32 insns[], int cnt)
 {
-	typeof(__aarch64_insn_patch_text) *fn = kallsyms_lookup_name("aarch64_insn_patch_text");
-	if (!fn)
-		return -ENOENT;
-	return fn(addrs, insns, cnt);
+	assume(!!aarch64_insn_patch_text_fn);
+	return ((typeof(__aarch64_insn_patch_text) *)aarch64_insn_patch_text_fn)(addrs, insns, cnt);
 }
 #define aarch64_insn_patch_text __aarch64_insn_patch_text
 
+static uintptr_t aarch64_insn_gen_branch_imm_fn = 0x0;
 static __nocfi u32 __aarch64_insn_gen_branch_imm(unsigned long pc, unsigned long addr, enum aarch64_insn_branch_type type)
 {
-	typeof(__aarch64_insn_gen_branch_imm) *fn = kallsyms_lookup_name("aarch64_insn_gen_branch_imm");
-	if (!fn)
-		return -ENOENT;
-	return fn(pc, addr, type);
+	assume(!!aarch64_insn_gen_branch_imm_fn);
+	return ((typeof(__aarch64_insn_gen_branch_imm) *)aarch64_insn_gen_branch_imm_fn)(pc, addr, type);
 }
 #define aarch64_insn_gen_branch_imm __aarch64_insn_gen_branch_imm
+
+static uintptr_t kallsyms_lookup_name_fn = 0x0;
+static __nocfi unsigned long __kallsyms_lookup_name(const char *name)
+{
+	assume(!!kallsyms_lookup_name_fn);
+	return ((typeof (__kallsyms_lookup_name) *)kallsyms_lookup_name_fn)(name);
+}
+#define kallsyms_lookup_name __kallsyms_lookup_name
 
 /**
  *  kallsyms_lookup_size_offset from sprint_symbol actually
@@ -141,7 +88,106 @@ static int compat_kallsyms_lookup_size_offset(unsigned long addr, unsigned long 
 }
 #define kallsyms_lookup_size_offset compat_kallsyms_lookup_size_offset
 
+static int bootstrap_kallsyms_lookup_name(uintptr_t ptr)
+{
+	extern long copy_from_kernel_nofault(void *dst, const void *src, size_t size);
+
+	constexpr int max_iter = 100000;
+	constexpr char sym[] = "kallsyms_lookup_name+";
+	uintptr_t anchor = ptr;
+
+	char buf[KSYM_SYMBOL_LEN];
+	uint32_t ibuf;
+	int iter = 0;
+
+	uintptr_t curr = ptr;
+	bool up = true;
+
+	/**
+	 * radiating scan, expect some cache trashing.
+	 * however for this one it is worth it.
+	 */
+start_r:
+	if (iter >= max_iter) {
+		pr_info("%s: bootsrap fail! iter: %d\n", __func__, iter);
+		return -ERANGE;
+	}
+
+	if (!!copy_from_kernel_nofault(&ibuf, (void *)curr, sizeof(uint32_t)))
+		goto inc;
+
+	if (sprint_symbol(buf, curr) < sizeof(sym))
+		goto inc;
+
+	if (strstarts(buf, sym))
+		goto found_candidate;
+
+inc: // assumes that kallsyms_lookup_name is atleast 8 insns
+	if (up) {
+		iter++;
+		curr = anchor + sizeof(uint32_t) * 8 * iter;
+		up = false;
+	} else {
+		curr = anchor - sizeof(uint32_t) * 8 * iter;
+		up = true;
+	}
+
+	goto start_r;
+
+found_candidate:;
+	char *sl = strchr(buf, '/');
+	if (!sl)
+		goto inc;
+	
+	sl[0] = 0;
+
+	char *pl = strchr(buf, '+');
+	if (!pl)
+		goto inc;
+
+	pr_info("candidate found: %s @ 0x%lx\n", buf, curr);
+
+	unsigned long offset;
+	if (kstrtoul(pl + 1, 0, &offset))
+		goto inc;
+
+	uintptr_t test_p = curr - offset;
+	if (!(sprint_symbol(buf, test_p) > 0))
+		goto inc;
+
+	if (!strstr(buf, "+0x0"))
+		goto inc;
+
+	curr = curr - offset;
+	pr_info("%s: %s found at 0x%lx iter: %d\n", __func__, buf, curr, iter);
+	*(volatile uintptr_t *)&kallsyms_lookup_name_fn = curr;
+	smp_mb();
+	return 0;
+}
+
+static int bootstrap_module(void)
+{
+	constexpr char sym[] = "sprint_symbol";
+	uintptr_t addr = (uintptr_t)&sprint_symbol;
+	pr_info("%s: %s @ 0x%lx \n", __func__, sym, addr);
+	int err = bootstrap_kallsyms_lookup_name(addr);
+	if (err)
+		return err;
+
+	aarch64_insn_gen_branch_imm_fn = (uintptr_t)kallsyms_lookup_name("aarch64_insn_gen_branch_imm");
+	if (!aarch64_insn_gen_branch_imm_fn)
+		return -ENOENT;
+
+	aarch64_insn_patch_text_fn = (uintptr_t)kallsyms_lookup_name("aarch64_insn_patch_text");
+	if (!aarch64_insn_patch_text_fn)
+		return -ENOENT;
+
+	smp_mb();
+	return 0;
+}
+
 static struct kobject *mod_kobj_parent_backup = nullptr;
+
 #endif // MODULE
 
 // override kprobe reg and unreg
@@ -206,14 +252,10 @@ static int __init fgetpriority_init(void)
 	pr_info("init: Hello World!\n");
 
 #ifdef MODULE
-	constexpr char sym[] = "sprint_symbol";
-	uintptr_t addr = (uintptr_t)&sprint_symbol;
-	pr_info("%s: %s @ 0x%lx \n", __func__, sym, addr);
-	int err = bootstrap_kallsyms_lookup_name(addr);
+	int err = bootstrap_module();
 	if (err)
 		return err;
 #endif
-
 	int ret = getpriority_hook_init();
 	pr_info("init: ret: %d\n", ret);
 	if (!ret)
